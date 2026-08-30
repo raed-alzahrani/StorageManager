@@ -14,6 +14,7 @@ A high-performance desktop storage inspection and directory organizer built with
 - **Clipboard Operations:** Select items, cut with `Ctrl+X`, navigate to any directory, and paste with `Ctrl+V`.
 - **Automated Categorization:** One-click sorting of loose files into structured categories (Images, Documents, Media, Code, Archives).
 - **Modern Adaptive UI:** Built with CustomTkinter featuring clean accent palettes and Dark/Light modes.
+
 ---
 
 ## Keyboard Controls & Shortcuts
@@ -33,18 +34,28 @@ A high-performance desktop storage inspection and directory organizer built with
 ## Installation & Setup
 
 1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/raed-alzahrani/StorageManager.git
-   cd StorageManager
-   ```
+    git clone https://github.com/raed-alzahrani/StorageManager.git
+    cd StorageManager
 
 2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+    pip install -r requirements.txt
 
 3. **Run the application:**
-   ```bash
-   python main.pyw
-   ```
-   *(On Windows, you can double-click `main.pyw` directly without opening a terminal window).*
+    python main.pyw
+
+    *(On Windows, you can double-click `main.pyw` directly without opening a terminal window).*
+
+---
+
+## Requirements
+
+- Python 3.8+
+- customtkinter >= 5.2.0
+- pillow >= 10.0.0
+- tkinterdnd2 >= 0.3.0
+
+---
+
+## License
+
+Licensed under the MIT License (LICENSE).
