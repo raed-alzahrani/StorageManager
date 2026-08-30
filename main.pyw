@@ -3,12 +3,13 @@ import sys
 import json
 import time
 import shutil
+import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-# Auto-check dependencies
+# Dependency check
 REQUIRED_LIBS = {
     "customtkinter": "customtkinter",
     "PIL": "pillow"
@@ -76,6 +77,7 @@ import customtkinter as ctk
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+CACHE_FILE = os.path.join(BASE_DIR, "scan_cache.txt")
 
 CATEGORY_RULES = {
     "Images": ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff'],
@@ -149,7 +151,29 @@ def format_size(bytes_size):
         bytes_size /= 1024.0
     return f"{bytes_size:.1f} PB"
 
-def calculate_size_ultra_fast(target_path):
+def load_disk_cache():
+    cache = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split("|")
+                    if len(parts) == 3:
+                        p, mtime, sz = parts
+                        cache[p] = (float(mtime), int(sz))
+        except Exception:
+            pass
+    return cache
+
+def save_disk_cache(cache):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            for p, (mtime, sz) in cache.items():
+                f.write(f"{p}|{mtime}|{sz}\n")
+    except Exception:
+        pass
+
+def calculate_size_multithreaded(target_path, max_workers=16):
     if not os.path.exists(target_path):
         return 0
 
@@ -163,24 +187,62 @@ def calculate_size_ultra_fast(target_path):
         return 0
 
     total_bytes = 0
-    stack = [target_path]
+    size_lock = threading.Lock()
+    work_q = queue.Queue()
+    work_q.put(target_path)
 
-    while stack:
-        current_dir = stack.pop()
-        try:
-            with os.scandir(current_dir) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
+    active_tasks = 0
+    active_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    def worker():
+        nonlocal total_bytes, active_tasks
+        while not stop_event.is_set():
+            try:
+                current_dir = work_q.get(timeout=0.03)
+            except queue.Empty:
+                with active_lock:
+                    if active_tasks == 0 and work_q.empty():
+                        stop_event.set()
+                        return
+                continue
+
+            with active_lock:
+                active_tasks += 1
+
+            local_bytes = 0
+            try:
+                with os.scandir(current_dir) as entries:
+                    for entry in entries:
+                        try:
                             stat_res = entry.stat(follow_symlinks=False)
-                            if not (stat_res.st_file_attributes & 0x400):
-                                stack.append(entry.path)
-                        else:
-                            total_bytes += entry.stat(follow_symlinks=False).st_size
-                    except (PermissionError, OSError):
-                        continue
-        except (PermissionError, OSError):
-            continue
+                            if getattr(stat_res, 'st_file_attributes', 0) & 0x400:
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                work_q.put(entry.path)
+                            else:
+                                local_bytes += stat_res.st_size
+                        except (PermissionError, OSError):
+                            continue
+            except (PermissionError, OSError):
+                pass
+            finally:
+                if local_bytes > 0:
+                    with size_lock:
+                        total_bytes += local_bytes
+                with active_lock:
+                    active_tasks -= 1
+                work_q.task_done()
+
+    threads = []
+    num_threads = min(max_workers, 24)
+    for _ in range(num_threads):
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
 
     return total_bytes
 
@@ -189,9 +251,12 @@ class StorageManagerApp(ctk.CTk):
         super().__init__()
 
         self.title("Storage Manager & Organizer")
-        self.minsize(960, 640)
+        self.minsize(980, 640)
 
         self.config = self.load_config()
+        self.disk_cache = load_disk_cache()
+        self.cache_lock = threading.Lock()
+
         raw_theme = self.config.get("theme", "Emerald")
         self.current_theme = THEME_MIGRATION.get(raw_theme, raw_theme)
         if self.current_theme not in THEMES:
@@ -204,15 +269,16 @@ class StorageManagerApp(ctk.CTk):
         self.appearance_mode = self.config.get("appearance", "Dark")
         self.working_dir = self.config.get("working_dir", BASE_DIR)
         self.current_sort = self.config.get("sort_mode", "Size (Largest First)")
+        self.perf_mode = self.config.get("perf_mode", "Extreme")
 
         if not os.path.exists(self.working_dir):
             self.working_dir = BASE_DIR
 
         ctk.set_appearance_mode(self.appearance_mode)
 
-        saved_geom = self.config.get("geometry", "1000x700")
+        saved_geom = self.config.get("geometry", "1020x700")
         try: self.geometry(saved_geom)
-        except Exception: self.geometry("1000x700")
+        except Exception: self.geometry("1020x700")
 
         if self.config.get("maximized", False):
             self.after(100, lambda: self.state("zoomed"))
@@ -223,7 +289,6 @@ class StorageManagerApp(ctk.CTk):
         self.scanned_items_data = []
         self.displayed_count = 100
         self.focused_index = 0
-        self.last_key_time = 0
         self.is_scanning = False
         self.cut_clipboard_items = []
 
@@ -238,10 +303,10 @@ class StorageManagerApp(ctk.CTk):
 
     def load_config(self):
         defaults = {
-            "geometry": "1000x700", "maximized": False,
+            "geometry": "1020x700", "maximized": False,
             "theme": "Emerald", "font_profile": "Futuristic (Bahnschrift)",
             "appearance": "Dark", "working_dir": BASE_DIR,
-            "sort_mode": "Size (Largest First)"
+            "sort_mode": "Size (Largest First)", "perf_mode": "Extreme"
         }
         if os.path.exists(CONFIG_PATH):
             try:
@@ -255,12 +320,12 @@ class StorageManagerApp(ctk.CTk):
 
     def save_config(self):
         is_zoomed = (self.state() == "zoomed")
-        geom = self.config.get("geometry", "1000x700") if is_zoomed else self.geometry()
+        geom = self.config.get("geometry", "1020x700") if is_zoomed else self.geometry()
         self.config = {
             "geometry": geom, "maximized": is_zoomed,
             "theme": self.current_theme, "font_profile": self.current_font,
             "appearance": self.appearance_mode, "working_dir": self.working_dir,
-            "sort_mode": self.sort_menu.get()
+            "sort_mode": self.sort_menu.get(), "perf_mode": self.perf_picker.get()
         }
         try:
             with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
@@ -269,6 +334,7 @@ class StorageManagerApp(ctk.CTk):
 
     def on_close(self):
         self.save_config()
+        save_disk_cache(self.disk_cache)
         self.destroy()
 
     def _apply_appearance_backgrounds(self):
@@ -300,11 +366,15 @@ class StorageManagerApp(ctk.CTk):
         ctrls = ctk.CTkFrame(top_row, fg_color="transparent")
         ctrls.pack(side="right")
 
-        self.font_picker = ctk.CTkOptionMenu(ctrls, values=list(FONT_PROFILES.keys()), width=180, height=30, command=self.handle_font_change)
+        self.perf_picker = ctk.CTkOptionMenu(ctrls, values=["Normal", "Extreme"], width=100, height=30, command=self.handle_perf_change)
+        self.perf_picker.set(self.perf_mode)
+        self.perf_picker.pack(side="left", padx=3)
+
+        self.font_picker = ctk.CTkOptionMenu(ctrls, values=list(FONT_PROFILES.keys()), width=175, height=30, command=self.handle_font_change)
         self.font_picker.set(self.current_font)
         self.font_picker.pack(side="left", padx=3)
 
-        self.theme_picker = ctk.CTkOptionMenu(ctrls, values=list(THEMES.keys()), width=120, height=30, command=self.handle_theme_change)
+        self.theme_picker = ctk.CTkOptionMenu(ctrls, values=list(THEMES.keys()), width=115, height=30, command=self.handle_theme_change)
         self.theme_picker.set(self.current_theme)
         self.theme_picker.pack(side="left", padx=3)
 
@@ -380,6 +450,7 @@ class StorageManagerApp(ctk.CTk):
         f = FONT_PROFILES.get(font_name, FONT_PROFILES["Futuristic (Bahnschrift)"])
 
         self.app_title.configure(font=f["title"])
+        self.perf_picker.configure(font=f["ui_sm"], dropdown_font=f["ui_sm"])
         self.font_picker.configure(font=f["ui_sm"], dropdown_font=f["ui_sm"])
         self.theme_picker.configure(font=f["ui_sm"], dropdown_font=f["ui_sm"])
         self.btn_mode_toggle.configure(font=f["ui_bold"])
@@ -408,6 +479,7 @@ class StorageManagerApp(ctk.CTk):
         self.btn_move.configure(fg_color=palette["btn_bg"], hover_color=palette["btn_hover"], border_color=pri, border_width=1, text_color="#ffffff")
         self.btn_refresh.configure(fg_color=palette["btn_bg"], hover_color=palette["btn_hover"], border_color=pri, border_width=1, text_color="#ffffff")
         
+        self.perf_picker.configure(fg_color=palette["menu_bg"], button_color=pri, button_hover_color=palette["hover"])
         self.font_picker.configure(fg_color=palette["menu_bg"], button_color=pri, button_hover_color=palette["hover"])
         self.theme_picker.configure(fg_color=palette["menu_bg"], button_color=pri, button_hover_color=palette["hover"])
         self.sort_menu.configure(fg_color=palette["menu_bg"], button_color=pri, button_hover_color=palette["hover"])
@@ -418,6 +490,11 @@ class StorageManagerApp(ctk.CTk):
         self.btn_select_all.configure(hover_color=palette["btn_hover"])
         self.btn_up.configure(hover_color=palette["btn_hover"])
         self.btn_browse.configure(hover_color=palette["btn_hover"])
+
+    def handle_perf_change(self, mode):
+        self.perf_mode = mode
+        self.save_config()
+        self.log(f"Performance mode set to: {mode}")
 
     def handle_font_change(self, font_name):
         self.apply_font(font_name)
@@ -452,15 +529,12 @@ class StorageManagerApp(ctk.CTk):
         if self._is_typing() or not self.current_display_items:
             return
 
-        now = time.time()
         key = event.keysym.lower()
         char = event.char.lower() if event.char else ""
 
-        is_nav_key = key in ("up", "w", "down", "s") or char in ("w", "ص", "s", "س")
-        if is_nav_key:
-            if now - self.last_key_time < 0.04:
-                return "break"
-            self.last_key_time = now
+        if key in ("delete", "del"):
+            self.delete_selected()
+            return "break"
 
         if key in ("up", "w") or char in ("w", "ص"):
             return self._handle_key_nav("up")
@@ -512,24 +586,18 @@ class StorageManagerApp(ctk.CTk):
             self.row_widgets[old_idx][0].configure(fg_color="transparent", border_width=0)
 
         if 0 <= new_idx < len(self.row_widgets):
-            self.row_widgets[new_idx][0].configure(fg_color=focus_bg, border_width=1, border_color=palette["focus_border"])
+            target_widget = self.row_widgets[new_idx][0]
+            target_widget.configure(fg_color=focus_bg, border_width=1, border_color=palette["focus_border"])
 
             try:
                 canvas = self.scroll_area._parent_canvas
-                total = max(1, len(self.row_widgets))
                 view_top, view_bottom = canvas.yview()
-                view_height = max(0.01, view_bottom - view_top)
+                total = len(self.row_widgets)
+                item_pos = new_idx / total
 
-                item_top = new_idx / total
-                item_bottom = (new_idx + 1) / total
-                padding = max(0.02, view_height * 0.22)
-
-                if item_bottom > view_bottom - padding:
-                    target = item_bottom - view_height + padding
-                    canvas.yview_moveto(min(1.0, max(0.0, target)))
-                elif item_top < view_top + padding:
-                    target = item_top - padding
-                    canvas.yview_moveto(max(0.0, target))
+                if item_pos < view_top or item_pos > view_bottom - 0.05:
+                    target_view = max(0.0, min(1.0, item_pos - 0.1))
+                    canvas.yview_moveto(target_view)
             except Exception:
                 pass
 
@@ -617,6 +685,7 @@ class StorageManagerApp(ctk.CTk):
 
         self.is_scanning = True
         self.displayed_count = 100
+        self.focused_index = 0
         self.btn_refresh.configure(state="disabled", text="Scanning...")
 
         for widget in self.scroll_area.winfo_children(): widget.destroy()
@@ -628,6 +697,7 @@ class StorageManagerApp(ctk.CTk):
 
     def _scan_thread_worker(self):
         try:
+            start_time = time.time()
             try:
                 all_items = os.listdir(self.working_dir)
             except Exception as e:
@@ -636,25 +706,63 @@ class StorageManagerApp(ctk.CTk):
 
             targets = [
                 f for f in all_items
-                if f not in ("config.json", "app_icon.ico")
+                if f not in ("config.json", "app_icon.ico", "scan_cache.txt")
                 and not f.startswith('.')
                 and not f.endswith(('.py', '.pyw', '.ico', '.bat'))
             ]
 
+            cpu_threads = os.cpu_count() or 4
+            if self.perf_mode == "Extreme":
+                top_workers = max(16, cpu_threads * 2)
+                sub_workers = 16
+            else:
+                top_workers = 4
+                sub_workers = 2
+
+            cache_hits = 0
+            cache_hits_lock = threading.Lock()
+
             def process_single_item(name):
+                nonlocal cache_hits
                 item_path = os.path.join(self.working_dir, name)
+                try:
+                    current_mtime = os.path.getmtime(item_path)
+                except OSError:
+                    current_mtime = 0
+
                 is_dir = os.path.isdir(item_path)
-                size_bytes = calculate_size_ultra_fast(item_path)
+                size_bytes = None
+
+                with self.cache_lock:
+                    if item_path in self.disk_cache:
+                        cached_mtime, cached_sz = self.disk_cache[item_path]
+                        if abs(cached_mtime - current_mtime) < 0.001:
+                            size_bytes = cached_sz
+                            with cache_hits_lock:
+                                cache_hits += 1
+
+                if size_bytes is None:
+                    size_bytes = calculate_size_multithreaded(item_path, max_workers=sub_workers)
+                    with self.cache_lock:
+                        self.disk_cache[item_path] = (current_mtime, size_bytes)
+
                 if size_bytes < 1024:
                     return None
                 ext = os.path.splitext(name)[1].lower() if not is_dir else "folder"
                 return (name, size_bytes, is_dir, ext)
 
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=top_workers) as executor:
                 results = list(executor.map(process_single_item, targets))
 
             processed = [item for item in results if item is not None]
             self.scanned_items_data = processed
+            elapsed = time.time() - start_time
+
+            save_disk_cache(self.disk_cache)
+
+            self.after(0, lambda: self.log(
+                f"Scan finished in {elapsed:.2f}s ({self.perf_mode} mode | Cache hits: {cache_hits}/{len(targets)})"
+            ))
             self.after(0, lambda: self._render_scanned_items(processed))
         except Exception as e:
             self.after(0, lambda: self.log(f"Scan failed: {e}"))
@@ -756,6 +864,14 @@ class StorageManagerApp(ctk.CTk):
 
             self.log(f"Showing top {len(self.current_display_items)} of {len(sorted_items)} items. Total: {format_size(total_dir_size)}")
 
+        self.update_idletasks()
+        try:
+            canvas = self.scroll_area._parent_canvas
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.yview_moveto(0.0)
+        except Exception:
+            pass
+
     def cut_selected(self):
         selected = [name for name, var in self.file_vars.items() if var.get()]
         if not selected:
@@ -838,6 +954,9 @@ class StorageManagerApp(ctk.CTk):
 
     def delete_selected(self):
         selected = [name for name, var in self.file_vars.items() if var.get()]
+        if not selected and 0 <= self.focused_index < len(self.current_display_items):
+            selected = [self.current_display_items[self.focused_index][0]]
+
         if not selected:
             messagebox.showwarning("Warning", "No items selected.")
             return
@@ -847,10 +966,17 @@ class StorageManagerApp(ctk.CTk):
         for name in selected:
             p = os.path.join(self.working_dir, name)
             try:
-                shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+                if os.path.isdir(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
                 self.log(f"Deleted: {name}")
+                with self.cache_lock:
+                    self.disk_cache.pop(p, None)
             except Exception as e:
                 self.log(f"Failed to delete {name}: {e}")
+
+        save_disk_cache(self.disk_cache)
         self.refresh_list()
 
 if __name__ == "__main__":
