@@ -58,4 +58,4 @@ A high-performance desktop storage inspection and directory organizer built with
 
 ## License
 
-Licensed under the MIT License (LICENSE).
+Licensed under the MIT License ([LICENSE](LICENSE)).
