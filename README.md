@@ -6,14 +6,14 @@ A high-performance desktop storage inspection and directory organizer built with
 
 ## Features
 
-- **Ultra-Fast Disk Sizing:** Multi-threaded iterative directory scanner engineered to bypass Windows NTFS junction loops and reparse points smoothly.
-- **Smart Space Filtering:** Automatically ignores empty or negligible items (< 1 KB) to focus only on actual space consumers.
+- **Multi-Level Parallel Scanner:** Deep recursive folder sizing powered by a multi-threaded queue worker that scales across all CPU threads.
+- **Configurable Performance Profiles:** Toggle on the fly between **Normal** (balanced I/O) and **Extreme** (full parallel throughput for high-speed NVMe drives).
+- **Persistent Disk Caching:** Stores file timestamps (`mtime`) and calculated sizes to skip rescanning unmodified directory trees instantly.
 - **Dynamic Sorting:** Sort items by space consumed (Largest / Smallest), alphabetical names (A-Z), or file extensions.
-- **Keyboard-Centric Navigation:** Full directional navigation using WASD or arrow keys with viewport auto-scroll.
-- **Clipboard Move (Cut & Paste):** Select items, cut with `Ctrl+X`, navigate to any directory, and paste with `Ctrl+V`.
-- **Automated Categorization:** One-click organization of raw files into structured categories (Images, Documents, Media, Code, Archives, etc.).
-- **Modern Adaptive UI:** Built with CustomTkinter featuring custom color accents and Dark/Light modes.
-
+- **Keyboard-Centric Navigation:** Smooth WASD and arrow key navigation with zero input latency and responsive viewport scrolling.
+- **Clipboard Operations:** Select items, cut with `Ctrl+X`, navigate to any directory, and paste with `Ctrl+V`.
+- **Automated Categorization:** One-click sorting of loose files into structured categories (Images, Documents, Media, Code, Archives).
+- **Modern Adaptive UI:** Built with CustomTkinter featuring clean accent palettes and Dark/Light modes.
 ---
 
 ## Keyboard Controls & Shortcuts
