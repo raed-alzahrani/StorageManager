@@ -5,6 +5,7 @@ import json
 import shutil
 import threading
 import time
+import queue
 from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -79,6 +80,7 @@ SCRIPT_FILE = os.path.abspath(__file__)
 SCRIPT_DIR = os.path.dirname(SCRIPT_FILE)
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 APP_ICON_FILE = os.path.join(SCRIPT_DIR, "app_icon.ico")
+CACHE_FILE = os.path.join(SCRIPT_DIR, "scan_cache.txt")
 
 IMAGE_EXTS = (('Image Files', '*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.ico'), ('All Files', '*.*'))
 
@@ -127,7 +129,29 @@ def format_size(bytes_size):
         bytes_size /= 1024.0
     return f"{bytes_size:.1f} PB"
 
-def calculate_size_ultra_fast(target_path):
+def load_disk_cache():
+    cache = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split("|")
+                    if len(parts) == 3:
+                        p, mtime, sz = parts
+                        cache[p] = (float(mtime), int(sz))
+        except Exception:
+            pass
+    return cache
+
+def save_disk_cache(cache):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            for p, (mtime, sz) in cache.items():
+                f.write(f"{p}|{mtime}|{sz}\n")
+    except Exception:
+        pass
+
+def calculate_size_multithreaded(target_path, max_workers=16):
     if not os.path.exists(target_path):
         return 0
 
@@ -141,24 +165,62 @@ def calculate_size_ultra_fast(target_path):
         return 0
 
     total_bytes = 0
-    stack = [target_path]
+    size_lock = threading.Lock()
+    work_q = queue.Queue()
+    work_q.put(target_path)
 
-    while stack:
-        current_dir = stack.pop()
-        try:
-            with os.scandir(current_dir) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
+    active_tasks = 0
+    active_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    def worker():
+        nonlocal total_bytes, active_tasks
+        while not stop_event.is_set():
+            try:
+                current_dir = work_q.get(timeout=0.03)
+            except queue.Empty:
+                with active_lock:
+                    if active_tasks == 0 and work_q.empty():
+                        stop_event.set()
+                        return
+                continue
+
+            with active_lock:
+                active_tasks += 1
+
+            local_bytes = 0
+            try:
+                with os.scandir(current_dir) as entries:
+                    for entry in entries:
+                        try:
                             stat_res = entry.stat(follow_symlinks=False)
-                            if not (stat_res.st_file_attributes & 0x400):
-                                stack.append(entry.path)
-                        else:
-                            total_bytes += entry.stat(follow_symlinks=False).st_size
-                    except (PermissionError, OSError):
-                        continue
-        except (PermissionError, OSError):
-            continue
+                            if getattr(stat_res, 'st_file_attributes', 0) & 0x400:
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                work_q.put(entry.path)
+                            else:
+                                local_bytes += stat_res.st_size
+                        except (PermissionError, OSError):
+                            continue
+            except (PermissionError, OSError):
+                pass
+            finally:
+                if local_bytes > 0:
+                    with size_lock:
+                        total_bytes += local_bytes
+                with active_lock:
+                    active_tasks -= 1
+                work_q.task_done()
+
+    threads = []
+    num_threads = min(max_workers, 24)
+    for _ in range(num_threads):
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
 
     return total_bytes
 
@@ -286,17 +348,19 @@ class MatrixStorageManager(ctk.CTk):
         super().__init__()
 
         self.title("MATRIX // STORAGE_MANAGER_SUITE_V6.0")
-        self.minsize(920, 620)
+        self.minsize(980, 620)
 
         self.config = self.load_config()
+        self.disk_cache = load_disk_cache()
+        self.cache_lock = threading.Lock()
 
         if os.path.exists(APP_ICON_FILE):
             try: self.iconbitmap(APP_ICON_FILE)
             except Exception: pass
 
-        saved_geometry = self.config.get("window_geometry", "980x680")
+        saved_geometry = self.config.get("window_geometry", "1020x680")
         try: self.geometry(saved_geometry)
-        except Exception: self.geometry("980x680")
+        except Exception: self.geometry("1020x680")
 
         if self.config.get("is_maximized", False):
             self.after(100, lambda: self.state("zoomed"))
@@ -306,6 +370,7 @@ class MatrixStorageManager(ctk.CTk):
         self.current_appearance = self.config.get("appearance_mode", "Dark")
         self.target_dir = self.config.get("target_dir", SCRIPT_DIR)
         self.current_sort = self.config.get("sort_mode", "Size (Largest First)")
+        self.perf_mode = self.config.get("perf_mode", "Extreme")
 
         if not os.path.exists(self.target_dir):
             self.target_dir = SCRIPT_DIR
@@ -318,9 +383,9 @@ class MatrixStorageManager(ctk.CTk):
         self.scanned_items_data = []
         self.displayed_count = 100
         self.focused_index = 0
-        self.last_key_time = 0
         self.is_scanning = False
         self.cut_clipboard_items = []
+        self.undo_sort_history = []
 
         self._apply_appearance_backgrounds()
         self._build_matrix_ui()
@@ -333,10 +398,10 @@ class MatrixStorageManager(ctk.CTk):
 
     def load_config(self):
         default_cfg = {
-            "window_geometry": "980x680", "is_maximized": False,
+            "window_geometry": "1020x680", "is_maximized": False,
             "font_profile": "Retro Matrix (Consolas)", "theme_color": "Green",
             "appearance_mode": "Dark", "target_dir": SCRIPT_DIR,
-            "sort_mode": "Size (Largest First)"
+            "sort_mode": "Size (Largest First)", "perf_mode": "Extreme"
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -348,13 +413,13 @@ class MatrixStorageManager(ctk.CTk):
     def save_config(self):
         try:
             is_max = (self.state() == "zoomed")
-            current_geom = self.config.get("window_geometry", "980x680") if is_max else self.geometry()
+            current_geom = self.config.get("window_geometry", "1020x680") if is_max else self.geometry()
 
             self.config = {
                 "window_geometry": current_geom, "is_maximized": is_max,
                 "font_profile": self.current_font_profile, "theme_color": self.current_theme_color,
                 "appearance_mode": self.current_appearance, "target_dir": self.target_dir,
-                "sort_mode": self.sort_menu.get()
+                "sort_mode": self.sort_menu.get(), "perf_mode": self.perf_menu.get()
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=4)
@@ -362,10 +427,12 @@ class MatrixStorageManager(ctk.CTk):
 
     def on_app_close(self):
         self.save_config()
+        save_disk_cache(self.disk_cache)
         self.destroy()
 
     def restart_application(self):
         self.save_config()
+        save_disk_cache(self.disk_cache)
         subprocess.Popen([sys.executable.replace("python.exe", "pythonw.exe"), SCRIPT_FILE], creationflags=0x08000000 if sys.platform == "win32" else 0)
         self.destroy()
         sys.exit()
@@ -432,7 +499,7 @@ class MatrixStorageManager(ctk.CTk):
         ctrl_top_box = ctk.CTkFrame(top_bar, fg_color="transparent")
         ctrl_top_box.pack(side="right", padx=2, pady=2)
 
-        self.btn_shortcut = ctk.CTkButton(ctrl_top_box, text="📌 SHORTCUT", width=90, font=f["ui_sm"], fg_color="#1e293b", hover_color="#334155", command=self.create_desktop_shortcut_now)
+        self.btn_shortcut = ctk.CTkButton(ctrl_top_box, text="📌 SHORTCUT", width=85, font=f["ui_sm"], fg_color="#1e293b", hover_color="#334155", command=self.create_desktop_shortcut_now)
         self.btn_shortcut.pack(side="left", padx=2)
 
         self.btn_change_icon = ctk.CTkButton(ctrl_top_box, text="🖼️ ICON", width=65, font=f["ui_sm"], fg_color="#581c87", hover_color="#6b21a8", command=self.change_app_icon_live)
@@ -441,15 +508,19 @@ class MatrixStorageManager(ctk.CTk):
         self.btn_update = ctk.CTkButton(ctrl_top_box, text="⚡ UPDATE", width=75, font=f["ui_sm"], fg_color="#0369a1", hover_color="#0284c7", command=self.open_hot_updater)
         self.btn_update.pack(side="left", padx=2)
 
-        self.font_menu = ctk.CTkOptionMenu(ctrl_top_box, values=list(FONT_PROFILES.keys()), command=self.on_font_selected, width=145, font=f["ui_sm"], dropdown_font=f["ui_sm"])
+        self.perf_menu = ctk.CTkOptionMenu(ctrl_top_box, values=["Normal", "Extreme"], command=self.on_perf_mode_changed, width=95, font=f["ui_sm"], dropdown_font=f["ui_sm"])
+        self.perf_menu.set(self.perf_mode)
+        self.perf_menu.pack(side="left", padx=2)
+
+        self.font_menu = ctk.CTkOptionMenu(ctrl_top_box, values=list(FONT_PROFILES.keys()), command=self.on_font_selected, width=135, font=f["ui_sm"], dropdown_font=f["ui_sm"])
         self.font_menu.set(self.current_font_profile)
         self.font_menu.pack(side="left", padx=2)
 
-        self.theme_menu = ctk.CTkOptionMenu(ctrl_top_box, values=list(THEME_PALETTES.keys()), command=self.on_theme_selected, width=95, font=f["ui_sm"], dropdown_font=f["ui_sm"])
+        self.theme_menu = ctk.CTkOptionMenu(ctrl_top_box, values=list(THEME_PALETTES.keys()), command=self.on_theme_selected, width=90, font=f["ui_sm"], dropdown_font=f["ui_sm"])
         self.theme_menu.set(self.current_theme_color)
         self.theme_menu.pack(side="left", padx=2)
 
-        self.btn_toggle_mode = ctk.CTkButton(ctrl_top_box, text="🌙 DARK" if self.current_appearance == "Dark" else "☀️ LIGHT", width=75, font=f["ui_sm"], fg_color="#1e293b", hover_color="#334155", command=self.toggle_appearance_mode)
+        self.btn_toggle_mode = ctk.CTkButton(ctrl_top_box, text="🌙 DARK" if self.current_appearance == "Dark" else "☀️ LIGHT", width=70, font=f["ui_sm"], fg_color="#1e293b", hover_color="#334155", command=self.toggle_appearance_mode)
         self.btn_toggle_mode.pack(side="left", padx=2)
 
         self.dir_frame = ctk.CTkFrame(self, fg_color=self.card_bg, corner_radius=8, border_width=1, border_color=self.panel_border)
@@ -472,20 +543,23 @@ class MatrixStorageManager(ctk.CTk):
         self.opts_frame = ctk.CTkFrame(self, fg_color=self.card_bg, corner_radius=8, border_width=1, border_color=self.panel_border)
         self.opts_frame.pack(fill="x", padx=14, pady=3)
 
-        self.new_folder_entry = ctk.CTkEntry(self.opts_frame, placeholder_text="New folder name...", font=f["ui_sm"], fg_color=self.inner_bg, height=30, width=180)
-        self.new_folder_entry.pack(side="left", padx=(10, 3), pady=6)
+        self.new_folder_entry = ctk.CTkEntry(self.opts_frame, placeholder_text="New folder name...", font=f["ui_sm"], fg_color=self.inner_bg, height=30, width=170)
+        self.new_folder_entry.pack(side="left", padx=(10, 2), pady=6)
 
-        self.btn_move_selected = ctk.CTkButton(self.opts_frame, text="[➔ MOVE]", font=f["ui_bold"], command=self.move_selected_to_folder, height=30, width=80)
+        self.btn_move_selected = ctk.CTkButton(self.opts_frame, text="[➔ MOVE]", font=f["ui_bold"], command=self.move_selected_to_folder, height=30, width=75)
         self.btn_move_selected.pack(side="left", padx=2, pady=6)
 
-        self.btn_cut = ctk.CTkButton(self.opts_frame, text="[✂ CUT]", font=f["ui_bold"], fg_color="#334155", hover_color="#475569", command=self.cut_selected_items, height=30, width=75)
+        self.btn_cut = ctk.CTkButton(self.opts_frame, text="[✂ CUT]", font=f["ui_bold"], fg_color="#334155", hover_color="#475569", command=self.cut_selected_items, height=30, width=70)
         self.btn_cut.pack(side="left", padx=2, pady=6)
 
-        self.btn_paste = ctk.CTkButton(self.opts_frame, text="[📋 PASTE]", font=f["ui_bold"], fg_color="#1e293b", hover_color="#334155", command=self.paste_cut_items, height=30, width=85)
+        self.btn_paste = ctk.CTkButton(self.opts_frame, text="[📋 PASTE]", font=f["ui_bold"], fg_color="#1e293b", hover_color="#334155", command=self.paste_cut_items, height=30, width=80)
         self.btn_paste.pack(side="left", padx=2, pady=6)
 
-        self.btn_auto_categorize = ctk.CTkButton(self.opts_frame, text="[⚡ AUTO SORT]", font=f["ui_bold"], fg_color="#334155", hover_color="#475569", command=self.auto_categorize_files, height=30, width=110)
+        self.btn_auto_categorize = ctk.CTkButton(self.opts_frame, text="[⚡ AUTO SORT]", font=f["ui_bold"], fg_color="#334155", hover_color="#475569", command=self.auto_categorize_files, height=30, width=105)
         self.btn_auto_categorize.pack(side="left", padx=2, pady=6)
+
+        self.btn_revert_sort = ctk.CTkButton(self.opts_frame, text="[⟲ REVERT]", font=f["ui_bold"], fg_color="#854d0e", hover_color="#a16207", text_color="#fef08a", command=self.revert_auto_categorize, height=30, width=90)
+        self.btn_revert_sort.pack(side="left", padx=2, pady=6)
 
         self.sort_menu = ctk.CTkOptionMenu(
             self.opts_frame, 
@@ -502,7 +576,7 @@ class MatrixStorageManager(ctk.CTk):
         self.btn_select_all = ctk.CTkButton(self.opts_frame, text="TOGGLE ALL", width=95, font=f["ui_bold"], command=self.toggle_all_selection, fg_color="#1e293b", hover_color="#334155", border_width=1, border_color=self.panel_border, height=30)
         self.btn_select_all.pack(side="right", padx=2, pady=6)
 
-        self.list_lbl = ctk.CTkLabel(self, text=">>> DETECTED STORAGE PAYLOADS (W/S to move | Enter/Space to select | D / -> to open folder):", anchor="w", font=f["ui_bold"], text_color=self.text_muted)
+        self.list_lbl = ctk.CTkLabel(self, text=">>> DETECTED STORAGE PAYLOADS (W/S to move | Enter/Space to select | D/-> open | Del to purge):", anchor="w", font=f["ui_bold"], text_color=self.text_muted)
         self.list_lbl.pack(fill="x", padx=18, pady=(4, 2))
 
         self.scroll_frame = ctk.CTkScrollableFrame(self, height=190, corner_radius=8, fg_color=self.card_bg, border_width=1, border_color=self.panel_border)
@@ -530,6 +604,11 @@ class MatrixStorageManager(ctk.CTk):
         self.btn_delete_selected = ctk.CTkButton(btn_frame, text="[✖ DELETE SELECTED ITEMS]", font=f["ui_bold"], fg_color="#7f1d1d", hover_color="#991b1b", text_color="#ffffff", command=self.delete_selected_items, height=38)
         self.btn_delete_selected.pack(side="right", fill="x", expand=True, padx=(6, 0))
 
+    def on_perf_mode_changed(self, mode):
+        self.perf_mode = mode
+        self.save_config()
+        self.log(f"[SYS] Execution mode switched to: {mode.upper()}", "cyan")
+
     def _bind_global_key_events(self):
         self.bind_all("<KeyPress>", self._on_global_key_press)
 
@@ -547,25 +626,25 @@ class MatrixStorageManager(ctk.CTk):
             elif k == "v" and not self._is_typing() and self.cut_clipboard_items:
                 self.paste_cut_items()
                 return "break"
+            elif k == "z" and not self._is_typing() and self.undo_sort_history:
+                self.revert_auto_categorize()
+                return "break"
 
         if self._is_typing() or not self.current_display_items:
             return
 
-        now = time.time()
         key = event.keysym.lower()
         char = event.char.lower() if event.char else ""
 
-        is_nav_key = key in ("up", "w", "down", "s") or char in ("w", "ص", "s", "س")
-        if is_nav_key:
-            if now - self.last_key_time < 0.04:
-                return "break"
-            self.last_key_time = now
+        if key in ("delete", "del"):
+            self.delete_selected_items()
+            return "break"
 
         if key in ("up", "w") or char in ("w", "ص"):
             return self._handle_key_nav("up")
         elif key in ("down", "s") or char in ("s", "س"):
             return self._handle_key_nav("down")
-        elif key in ("left", "a", "backspace") or char in ("a", "ش"):
+        elif key in ("left", "a") or char in ("a", "ش"):
             return self._handle_key_nav("left")
         elif key in ("right", "d") or char in ("d", "ي"):
             return self._handle_key_nav("open")
@@ -611,24 +690,18 @@ class MatrixStorageManager(ctk.CTk):
             self.row_widgets[old_idx][0].configure(fg_color="transparent", border_width=0)
         
         if 0 <= new_idx < len(self.row_widgets):
-            self.row_widgets[new_idx][0].configure(fg_color=focus_bg, border_width=1, border_color=palette["primary"])
+            target_widget = self.row_widgets[new_idx][0]
+            target_widget.configure(fg_color=focus_bg, border_width=1, border_color=palette["primary"])
             
             try:
                 canvas = self.scroll_frame._parent_canvas
-                total = max(1, len(self.row_widgets))
                 view_top, view_bottom = canvas.yview()
-                view_height = max(0.01, view_bottom - view_top)
-                
-                item_top = new_idx / total
-                item_bottom = (new_idx + 1) / total
-                padding = max(0.02, view_height * 0.22)
-                
-                if item_bottom > view_bottom - padding:
-                    target = item_bottom - view_height + padding
-                    canvas.yview_moveto(min(1.0, max(0.0, target)))
-                elif item_top < view_top + padding:
-                    target = item_top - padding
-                    canvas.yview_moveto(max(0.0, target))
+                total = len(self.row_widgets)
+                item_pos = new_idx / total
+
+                if item_pos < view_top or item_pos > view_bottom - 0.05:
+                    target_view = max(0.0, min(1.0, item_pos - 0.1))
+                    canvas.yview_moveto(target_view)
             except Exception:
                 pass
 
@@ -654,6 +727,7 @@ class MatrixStorageManager(ctk.CTk):
         self.btn_shortcut.configure(font=f["ui_sm"])
         self.btn_update.configure(font=f["ui_sm"])
         self.btn_change_icon.configure(font=f["ui_sm"])
+        self.perf_menu.configure(font=f["ui_sm"], dropdown_font=f["ui_sm"])
         self.font_menu.configure(font=f["ui_sm"], dropdown_font=f["ui_sm"])
         self.theme_menu.configure(font=f["ui_sm"], dropdown_font=f["ui_sm"])
         self.btn_toggle_mode.configure(font=f["ui_sm"])
@@ -666,6 +740,7 @@ class MatrixStorageManager(ctk.CTk):
         self.btn_cut.configure(font=f["ui_bold"])
         self.btn_paste.configure(font=f["ui_bold"])
         self.btn_auto_categorize.configure(font=f["ui_bold"])
+        self.btn_revert_sort.configure(font=f["ui_bold"])
         self.btn_select_all.configure(font=f["ui_bold"])
         self.sort_menu.configure(font=f["ui_sm"], dropdown_font=f["ui_sm"])
         self.list_lbl.configure(font=f["ui_bold"])
@@ -714,6 +789,7 @@ class MatrixStorageManager(ctk.CTk):
         self.theme_menu.configure(fg_color=palette["dark_bg"], button_color=pri, button_hover_color=palette["hover"])
         self.font_menu.configure(fg_color=palette["dark_bg"], button_color=pri, button_hover_color=palette["hover"])
         self.sort_menu.configure(fg_color=palette["dark_bg"], button_color=pri, button_hover_color=palette["hover"])
+        self.perf_menu.configure(fg_color=palette["dark_bg"], button_color=pri, button_hover_color=palette["hover"])
 
         self.btn_move_selected.configure(fg_color=palette["dark_bg"], hover_color=palette["dark_hover"], border_width=1, border_color=pri, text_color=pri if self.current_appearance == "Dark" else "#ffffff")
 
@@ -779,6 +855,7 @@ class MatrixStorageManager(ctk.CTk):
 
         self.is_scanning = True
         self.displayed_count = 100
+        self.focused_index = 0
         self.btn_refresh.configure(state="disabled", text="[SCANNING DIRECTORY...]")
 
         for widget in self.scroll_frame.winfo_children(): widget.destroy()
@@ -790,6 +867,7 @@ class MatrixStorageManager(ctk.CTk):
 
     def _scan_thread_worker(self):
         try:
+            start_time = time.time()
             try:
                 all_items = os.listdir(self.target_dir)
             except Exception as e:
@@ -798,25 +876,64 @@ class MatrixStorageManager(ctk.CTk):
 
             targets = [
                 f for f in all_items 
-                if f not in ("config.json", "app_icon.ico") 
+                if f not in ("config.json", "app_icon.ico", "scan_cache.txt") 
                 and not f.startswith('.') 
                 and not f.endswith(('.py', '.pyw', '.ico', '.bat'))
             ]
 
+            cpu_threads = os.cpu_count() or 4
+            if self.perf_mode == "Extreme":
+                top_workers = max(16, cpu_threads * 2)
+                sub_workers = 16
+            else:
+                top_workers = 4
+                sub_workers = 2
+
+            cache_hits = 0
+            cache_hits_lock = threading.Lock()
+
             def process_single_item(name):
+                nonlocal cache_hits
                 item_path = os.path.join(self.target_dir, name)
+                try:
+                    current_mtime = os.path.getmtime(item_path)
+                except OSError:
+                    current_mtime = 0
+
                 is_dir = os.path.isdir(item_path)
-                size_bytes = calculate_size_ultra_fast(item_path)
+                size_bytes = None
+
+                with self.cache_lock:
+                    if item_path in self.disk_cache:
+                        cached_mtime, cached_sz = self.disk_cache[item_path]
+                        if abs(cached_mtime - current_mtime) < 0.001:
+                            size_bytes = cached_sz
+                            with cache_hits_lock:
+                                cache_hits += 1
+
+                if size_bytes is None:
+                    size_bytes = calculate_size_multithreaded(item_path, max_workers=sub_workers)
+                    with self.cache_lock:
+                        self.disk_cache[item_path] = (current_mtime, size_bytes)
+
                 if size_bytes < 1024:
                     return None
                 ext = os.path.splitext(name)[1].lower() if not is_dir else "folder"
                 return (name, size_bytes, is_dir, ext)
 
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=top_workers) as executor:
                 results = list(executor.map(process_single_item, targets))
 
             processed = [item for item in results if item is not None]
             self.scanned_items_data = processed
+            elapsed = time.time() - start_time
+
+            save_disk_cache(self.disk_cache)
+
+            self.after(0, lambda: self.log(
+                f"[PERF] Scan complete in {elapsed:.2f}s ({self.perf_mode} Mode | Cache Hits: {cache_hits}/{len(targets)})", 
+                "ghost"
+            ))
             self.after(0, lambda: self._render_file_list(processed))
         except Exception as e:
             self.after(0, lambda: self.log(f"[CRITICAL ERROR] Scan worker failed: {e}", "crimson"))
@@ -826,7 +943,8 @@ class MatrixStorageManager(ctk.CTk):
             self.after(0, lambda: self.btn_refresh.configure(state="normal", text="[⟳ SCAN & ANALYZE DIRECTORY]"))
 
     def _render_file_list(self, raw_items):
-        for widget in self.scroll_frame.winfo_children(): widget.destroy()
+        for widget in self.scroll_frame.winfo_children(): 
+            widget.destroy()
         self.file_vars.clear()
         self.row_widgets.clear()
         self.focused_index = 0
@@ -908,6 +1026,15 @@ class MatrixStorageManager(ctk.CTk):
 
             self.log(f"[SYS] Displaying top {len(self.current_display_items)} of {len(sorted_items)} items. Total space: {format_size(total_dir_size)}", "cyan")
 
+        # Fix: Force Tkinter geometry update then reset canvas scrollregion properly
+        self.update_idletasks()
+        try:
+            canvas = self.scroll_frame._parent_canvas
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.yview_moveto(0.0)
+        except Exception:
+            pass
+
     def cut_selected_items(self):
         selected_items = [name for name, var in self.file_vars.items() if var.get()]
         if not selected_items:
@@ -983,10 +1110,11 @@ class MatrixStorageManager(ctk.CTk):
             messagebox.showinfo("Auto Organize", "No files found to categorize in this directory.")
             return
 
-        if not messagebox.askyesno("Confirm Auto Categorize", f"Organize {len(raw_items)} file(s) into category subfolders?"):
+        if not messagebox.askyesno("Confirm Auto Categorize", f"Organize {len(raw_items)} file(s) into category subfolders?\n(You can safely undo this anytime via [REVERT])"):
             return
 
         self.log("[EXEC] Commencing automated category sorting pipeline...", "gold")
+        current_operations = []
         organized_count = 0
 
         for name, _, _, ext in raw_items:
@@ -1004,24 +1132,68 @@ class MatrixStorageManager(ctk.CTk):
 
             try:
                 shutil.move(src, dst)
+                current_operations.append((src, dst))
                 self.log(f"  └─► [{target_category}] {name}", "primary")
                 organized_count += 1
             except Exception as e:
                 self.log(f"  └─► [FAIL] {name}: {e}", "crimson")
 
+        if current_operations:
+            self.undo_sort_history.append(current_operations)
+
         self.log(f"[SUCCESS] Auto-categorization finished: {organized_count} file(s) sorted.", "cyan")
+        self.refresh_file_list()
+
+    def revert_auto_categorize(self):
+        if not self.undo_sort_history:
+            messagebox.showinfo("Nothing to Revert", "No previous auto-categorization history found in this session.")
+            return
+
+        last_batch = self.undo_sort_history.pop()
+        if not messagebox.askyesno("Confirm Revert", f"Revert {len(last_batch)} file(s) back to their original root locations?"):
+            self.undo_sort_history.append(last_batch)
+            return
+
+        self.log(f"[REVERT] Restoring {len(last_batch)} file(s) to previous directories...", "gold")
+        reverted_count = 0
+        directories_to_clean = set()
+
+        for original_path, destination_path in last_batch:
+            if os.path.exists(destination_path):
+                try:
+                    shutil.move(destination_path, original_path)
+                    directories_to_clean.add(os.path.dirname(destination_path))
+                    self.log(f"  └─► [RESTORED] {os.path.basename(original_path)}", "primary")
+                    reverted_count += 1
+                except Exception as e:
+                    self.log(f"  └─► [FAIL] Could not revert {os.path.basename(original_path)}: {e}", "crimson")
+
+        for cat_dir in directories_to_clean:
+            try:
+                if os.path.isdir(cat_dir) and not os.listdir(cat_dir):
+                    os.rmdir(cat_dir)
+                    self.log(f"  └─► [REMOVED EMPTY FOLDER] {os.path.basename(cat_dir)}", "ghost")
+            except Exception:
+                pass
+
+        self.log(f"[SUCCESS] Revert complete: {reverted_count} file(s) restored.", "cyan")
         self.refresh_file_list()
 
     def delete_selected_items(self):
         selected_items = [name for name, var in self.file_vars.items() if var.get()]
+        
+        if not selected_items and 0 <= self.focused_index < len(self.current_display_items):
+            focused_item = self.current_display_items[self.focused_index][0]
+            selected_items = [focused_item]
+
         if not selected_items:
-            messagebox.showwarning("No Items Selected", "Please select items you wish to purge.")
+            messagebox.showwarning("No Items Selected", "Please select or highlight an item to purge.")
             return
 
-        if not messagebox.askyesno("Confirm Permanent Deletion", f"Are you sure you want to permanently delete {len(selected_items)} selected item(s)?\nThis cannot be undone."):
+        if not messagebox.askyesno("Confirm Permanent Deletion", f"Are you sure you want to permanently delete {len(selected_items)} item(s)?\nThis cannot be undone."):
             return
 
-        self.log(f"[PURGE] Deleting {len(selected_items)} selected items...", "crimson")
+        self.log(f"[PURGE] Deleting {len(selected_items)} items...", "crimson")
         for item_name in selected_items:
             p = os.path.join(self.target_dir, item_name)
             try:
@@ -1030,9 +1202,12 @@ class MatrixStorageManager(ctk.CTk):
                 else:
                     os.remove(p)
                 self.log(f"  └─► [DELETED] {item_name}", "ghost")
+                with self.cache_lock:
+                    self.disk_cache.pop(p, None)
             except Exception as e:
                 self.log(f"  └─► [FAIL] Could not delete {item_name}: {e}", "crimson")
 
+        save_disk_cache(self.disk_cache)
         self.refresh_file_list()
 
 if __name__ == "__main__":
